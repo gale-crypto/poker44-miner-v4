@@ -1,0 +1,24 @@
+# Local data — never committed
+*.pkl
+data/
+
+# The served weights ARE published; rollbacks and experiment artifacts are not.
+*.joblib
+!detector/artifacts/model.joblib
+
+# Private training pipeline
+detector/train.py
+
+# Secrets
+.env
+
+# Caches, builds, scratch
+__pycache__/
+*.pyc
+.venv/
+dist/
+build/
+*.egg-info/
+*.log
+_feature_cache.npz
+catboost_info/
