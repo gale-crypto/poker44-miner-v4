@@ -147,6 +147,34 @@ def _fallback_scores(chunks) -> list:
     return scores
 
 
+def _policy_enabled(meta) -> object:
+    """Drift-policy state, whichever meta.json layout this build wrote.
+
+    v4 records one policy report; v5 records one per feature view. Read both
+    rather than assuming, so a schema change downgrades the log line instead of
+    silently reporting None.
+    """
+    policy = meta.get("feature_policy") or {}
+    if "enabled" in policy:
+        return policy["enabled"]
+    for value in policy.values():
+        if isinstance(value, dict) and "enabled" in value:
+            return value["enabled"]
+    return None
+
+
+def _offline(meta, key: str) -> float:
+    """Offline holdout metric. Benchmark-only -- it does NOT predict live reward
+    (this family measured 0.93 offline against 0.53 live), so it is logged for
+    provenance, never as a health signal.
+    """
+    block = meta.get("offline_holdout") or meta.get("walk_forward") or {}
+    try:
+        return float(block.get(key, 0.0) or 0.0)
+    except (TypeError, ValueError):
+        return 0.0
+
+
 class Miner(BaseMinerNeuron):
     """Poker44 bot-detection miner."""
 
@@ -188,8 +216,13 @@ class Miner(BaseMinerNeuron):
         )
         self.manifest_compliance = evaluate_manifest_compliance(self.model_manifest)
         bt.logging.info(
-            f"Poker44 miner ready | reward={meta.get('cv_reward', 0):.4f} "
-            f"ap={meta.get('cv_ap', 0):.4f}")
+            f"Poker44 miner ready | version={meta.get('model_version', '?')} "
+            f"artifact={str(meta.get('artifact_sha256', ''))[:12]} "
+            f"features={meta.get('feature_count')} "
+            f"scale_norm={meta.get('scale_norm')} "
+            f"drift_policy={_policy_enabled(meta)} | "
+            f"offline reward={_offline(meta, 'reward'):.4f} "
+            f"ap={_offline(meta, 'ap'):.4f} (benchmark-only; does not predict live)")
         bt.logging.info(
             f"Manifest transparency: {self.manifest_compliance['status']} "
             f"(missing={self.manifest_compliance['missing_fields']}) "
