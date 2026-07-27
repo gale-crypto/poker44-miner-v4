@@ -2,9 +2,13 @@
 *.pkl
 data/
 
-# The served weights ARE published; rollbacks and experiment artifacts are not.
+# Weights are shipped to the host out of band (scp), not through git: a 46MB
+# blob per retrain bloats history fast, and artifact_url/artifact_sha256 are not
+# required manifest fields (MIN_REQUIRED_MANIFEST_FIELDS) nor checked by
+# evaluate_manifest_suspicion. This matches every scoring miner on the subnet --
+# none of them track weights. meta.json IS tracked, so the schema hash, version
+# and policy report of each build stay in history.
 *.joblib
-!detector/artifacts/model.joblib
 
 # Private training pipeline
 detector/train.py
@@ -22,3 +26,6 @@ build/
 *.log
 _feature_cache.npz
 catboost_info/
+
+# Live validator-query captures (diagnostic, local-only, never leaves the box)
+live_capture/

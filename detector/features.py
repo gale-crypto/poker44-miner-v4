@@ -16,6 +16,7 @@ namespaced apart.
 from __future__ import annotations
 
 import math
+import os
 from collections import Counter
 from typing import Any, Dict, List
 
@@ -109,7 +110,7 @@ def _amount_bucket(value: float) -> str:
         return "m"
     if value <= 5.0:
         return "l"
-        return "xl"
+    return "xl"
 
 
 def _hand_features(hand: dict[str, Any]) -> dict[str, float]:
@@ -212,27 +213,77 @@ def _hand_features(hand: dict[str, Any]) -> dict[str, float]:
         ),
         "pv_actor_run_max_share": _max_run_share(actor_seats),
         "pv_action_run_max_share": _max_run_share(action_types),
-        "pv_amount_mean_bb": _mean(amount_bb),
-        "pv_amount_std_bb": _std(amount_bb),
-        "pv_amount_q90_bb": _quantile(amount_bb, 0.9),
-        "pv_amount_max_bb": max(amount_bb) if amount_bb else 0.0,
+        # Absolute bb magnitudes. _normalize_scale rescales and renames these at
+        # chunk level; nothing downstream should read an _abs_ key directly.
+        "_abs_amount_mean_bb": _mean(amount_bb),
+        "_abs_amount_std_bb": _std(amount_bb),
+        "_abs_amount_q90_bb": _quantile(amount_bb, 0.9),
+        "_abs_amount_max_bb": max(amount_bb) if amount_bb else 0.0,
         "pv_nonzero_amount_share": _safe_div(nonzero_amount, max(1.0, action_count)),
-        "pv_pot_before_mean_bb": _mean(pot_before),
-        "pv_pot_after_mean_bb": _mean(pot_after),
-        "pv_pot_delta_mean_bb": _mean(pot_delta),
-        "pv_pot_growth_bb": (
+        "_abs_pot_before_mean_bb": _mean(pot_before),
+        "_abs_pot_after_mean_bb": _mean(pot_after),
+        "_abs_pot_delta_mean_bb": _mean(pot_delta),
+        "_abs_pot_growth_bb": (
             max(pot_after) - min(pot_before) if pot_after and pot_before else 0.0
         ),
         "pv_pot_monotonic_rate": _safe_div(monotonic, max(len(pot_after) - 1, 1)),
         "pv_raise_to_share": _safe_div(raise_to_present, max(1.0, action_count)),
         "pv_call_to_share": _safe_div(call_to_present, max(1.0, action_count)),
-        "pv_starting_stack_mean_bb": _mean(stack_bb),
-        "pv_starting_stack_std_bb": _std(stack_bb),
-        "pv_starting_stack_iqr_bb": _quantile(stack_bb, 0.75) - _quantile(stack_bb, 0.25),
+        "_abs_starting_stack_mean_bb": _mean(stack_bb),
+        "_abs_starting_stack_std_bb": _std(stack_bb),
+        "_abs_starting_stack_iqr_bb": _quantile(stack_bb, 0.75) - _quantile(stack_bb, 0.25),
         "pv_hero_action_share": _safe_div(hero_actions, max(1.0, action_count)),
         "pv_button_action_share": _safe_div(button_actions, max(1.0, action_count)),
         "pv_hero_button_same": float(hero_seat > 0 and hero_seat == button_seat),
     }
+
+
+# Chunk-level scale normalization.
+#
+# The public benchmark and live traffic do not share a money scale: benchmark
+# chunks run ~240bb stacks and ~110bb pot growth, live runs a pinned 100bb
+# buy-in and ~3-6bb pots. Measured against live validator payloads the raw bb
+# magnitudes read 3-35 sigma out of the training distribution, so every tree
+# split on them sends the whole live batch down one branch and contributes
+# nothing to the ranking.
+#
+# Expressing each magnitude as a ratio to the chunk's own median pot cancels the
+# scale factor. Set POKER44_SCALE_NORM=0 to emit the raw magnitudes under their
+# original pv_* names, which restores the pre-fix behaviour for an A/B.
+SCALE_NORM = os.environ.get("POKER44_SCALE_NORM", "1") != "0"
+_ABS_PREFIX = "_abs_"
+
+
+def _normalize_scale(
+    per_hand: list[dict[str, float]],
+    reference_key: str,
+    norm_prefix: str,
+    raw_prefix: str,
+) -> None:
+    """Rescale absolute bb magnitudes by the chunk's median pot, in place.
+
+    All ``_abs_*`` values are scale-linear (means, quantiles, maxima of bb
+    amounts), so dividing the per-hand aggregate is equivalent to normalising the
+    underlying amounts. ``_abs_x_bb`` becomes ``<norm_prefix>x`` when normalising
+    and ``<raw_prefix>x_bb`` when not, so the feature schema itself records which
+    variant produced an artifact and a stale artifact fails loudly.
+    """
+    if not per_hand:
+        return
+    if SCALE_NORM:
+        pots = [f[reference_key] for f in per_hand if f.get(reference_key, 0.0) > 0.0]
+        reference = _quantile(pots, 0.5) if pots else 0.0
+        scale = reference if reference > 1e-9 else 1.0
+    else:
+        scale = 1.0
+    for features in per_hand:
+        for key in [k for k in features if k.startswith(_ABS_PREFIX)]:
+            stem = key[len(_ABS_PREFIX):]
+            if SCALE_NORM:
+                name = norm_prefix + (stem[:-3] if stem.endswith("_bb") else stem)
+            else:
+                name = raw_prefix + stem
+            features[name] = features.pop(key) / scale
 
 
 def _aggregate_feature(prefix: str, values: list[float], out: dict[str, float]) -> None:
@@ -251,6 +302,7 @@ def chunk_features(chunk: list[dict[str, Any]]) -> dict[str, float]:
 
     out: dict[str, float] = {"hand_count": float(len(chunk))}
     per_hand = [_hand_features(hand) for hand in chunk]
+    _normalize_scale(per_hand, "_abs_pot_before_mean_bb", "pvrel_", "pv_")
     feature_names = sorted(per_hand[0].keys())
 
     for name in feature_names:
@@ -437,26 +489,29 @@ def _hand_view(hand: Dict[str, Any]) -> Dict[str, Any]:
     # bet sizing in bb (quantize-aware: amts are already coarse on live)
     if amts:
         s = sorted(amts)
-        feat["amt_mean"] = sum(amts) / len(amts)
-        feat["amt_std"] = (sum((x - feat["amt_mean"]) ** 2 for x in amts) / len(amts)) ** 0.5
-        feat["amt_max"] = s[-1]
-        feat["amt_q90"] = _bv_quantile(s, 0.9)
-        feat["amt_min"] = s[0]
+        mean_amt = sum(amts) / len(amts)
+        feat["_abs_amt_mean"] = mean_amt
+        feat["_abs_amt_std"] = (sum((x - mean_amt) ** 2 for x in amts) / len(amts)) ** 0.5
+        feat["_abs_amt_max"] = s[-1]
+        feat["_abs_amt_q90"] = _bv_quantile(s, 0.9)
+        feat["_abs_amt_min"] = s[0]
     else:
-        feat["amt_mean"] = feat["amt_std"] = feat["amt_max"] = feat["amt_q90"] = feat["amt_min"] = 0.0
+        feat["_abs_amt_mean"] = feat["_abs_amt_std"] = feat["_abs_amt_max"] = 0.0
+        feat["_abs_amt_q90"] = feat["_abs_amt_min"] = 0.0
     feat["nonzero_amt_share"] = _div(len(amts), max(n, 1))
     feat["bucket_entropy"] = _bv_entropy(list(Counter(buckets).values()))
 
     # pot dynamics
     if pots_after:
-        feat["pot_after_mean"] = sum(pots_after) / len(pots_after)
-        feat["pot_before_mean"] = sum(pots_before) / len(pots_before)
+        feat["_abs_pot_after_mean"] = sum(pots_after) / len(pots_after)
+        feat["_abs_pot_before_mean"] = sum(pots_before) / len(pots_before)
         deltas = [pots_after[i] - pots_before[i] for i in range(len(pots_after))]
-        feat["pot_delta_mean"] = sum(deltas) / len(deltas)
+        feat["_abs_pot_delta_mean"] = sum(deltas) / len(deltas)
         feat["pot_growth"] = _div(pots_after[-1], pots_before[0]) if pots_before and pots_before[0] else 0.0
         feat["pot_monotonic_rate"] = _div(sum(1 for d in deltas if d >= 0), max(len(deltas), 1))
     else:
-        feat["pot_after_mean"] = feat["pot_before_mean"] = feat["pot_delta_mean"] = 0.0
+        feat["_abs_pot_after_mean"] = feat["_abs_pot_before_mean"] = 0.0
+        feat["_abs_pot_delta_mean"] = 0.0
         feat["pot_growth"] = feat["pot_monotonic_rate"] = 0.0
 
     sig = {
@@ -492,6 +547,7 @@ def extract_behavior(hands: List[Dict[str, Any]]) -> Dict[str, float]:
         return out
 
     views = [_hand_view(h) for h in hands]
+    _normalize_scale([v["feat"] for v in views], "_abs_pot_before_mean", "rel_", "")
     # aggregate every per-hand scalar to chunk-level order-stats
     keys = list(views[0]["feat"].keys())
     for k in keys:

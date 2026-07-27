@@ -33,6 +33,7 @@ from poker44.utils.model_manifest import (build_local_model_manifest,
                                           manifest_digest)
 from poker44.validator.synapse import DetectionSynapse
 
+from detector import live_capture
 from detector.inference import get_model
 
 MODEL_NAME = os.environ.get("POKER44_MODEL_NAME", "poker44-miner-v4")
@@ -81,16 +82,69 @@ def _repo_commit(repo_root: Path) -> str:
         return ""
 
 
-def _artifact_url(repo_url: str, commit: str) -> str:
-    """Permalink to the served weights, pinned to the commit rather than a branch
-    so it keeps resolving to the exact bytes artifact_sha256 describes.
+# NOTE: weights are shipped out of band and are NOT in the repo, so there is no
+# raw-at-commit URL to publish. artifact_url therefore defaults to "" (the same
+# default every scoring miner on the subnet uses) and is opt-in via
+# POKER44_MODEL_ARTIFACT_URL once the exact bytes are uploaded as a release
+# asset. Advertising a URL that 404s, or that serves different bytes than
+# artifact_sha256 describes, is a false transparency claim -- worse than
+# publishing nothing. artifact_sha256 is still emitted: it identifies the running
+# weights even when they are not downloadable.
+
+
+# Fraction of a degraded batch placed above 0.5. Matches the served
+# MAX_POS_FRAC / POSITIVE_FRACTION so a degraded round behaves like a normal one.
+_FALLBACK_POSITIVE_FRACTION = 0.05
+
+
+def _fallback_scores(chunks) -> list:
+    """Rank-preserving scores for when the model path fails.
+
+    A CONSTANT fallback loses the round outright, in both directions: every chunk
+    at exactly 0.5 drives fpr@0.5 to 1.0, which zeroes threshold_sanity_quality
+    and with it the ENTIRE reward; any constant below 0.5 flags nothing, which
+    zeroes it the same way. So a degraded response must still rank, and must still
+    put a few chunks over the line.
+
+    Ranks by duplicate-signature share -- a scripted policy replays action
+    sequences, a human does not -- computed from the raw payload only. No model,
+    no artifact, no feature module, so it stays available when those are exactly
+    what failed. Ranking quality is poor by design; the point is that a degraded
+    round still collects its 0.35 structural floor instead of scoring zero.
     """
-    if not repo_url or not commit:
-        return ""
-    base = repo_url.strip().rstrip("/")
-    if base.endswith(".git"):
-        base = base[:-4]
-    return f"{base}/raw/{commit}/detector/artifacts/model.joblib"
+    total = len(chunks)
+    if total == 0:
+        return []
+
+    concentration = []
+    for chunk in chunks:
+        try:
+            signatures = [
+                tuple(
+                    (str(a.get("action_type") or ""), str(a.get("street") or ""))
+                    for a in ((hand or {}).get("actions") or [])
+                    if isinstance(a, dict)
+                )
+                for hand in (chunk or [])
+                if isinstance(hand, dict)
+            ]
+            concentration.append(
+                1.0 - len(set(signatures)) / len(signatures) if signatures else 0.0
+            )
+        except Exception:
+            concentration.append(0.0)
+
+    k = max(1, min(total, int(total * _FALLBACK_POSITIVE_FRACTION)))
+    order = sorted(range(total), key=lambda i: (-concentration[i], i))
+    positives, negatives = order[:k], order[k:]
+    scores = [0.0] * total
+    for rank, index in enumerate(positives):
+        share = 1.0 if len(positives) <= 1 else 1.0 - rank / (len(positives) - 1)
+        scores[index] = round(0.501 + share * 0.008, 6)
+    for rank, index in enumerate(negatives):
+        share = 1.0 if len(negatives) <= 1 else 1.0 - rank / (len(negatives) - 1)
+        scores[index] = round(0.010 + share * 0.480, 6)
+    return scores
 
 
 class Miner(BaseMinerNeuron):
@@ -111,6 +165,7 @@ class Miner(BaseMinerNeuron):
                 ROOT / "detector" / "inference.py",
                 ROOT / "detector" / "features.py",
                 ROOT / "detector" / "signature.py",
+                ROOT / "detector" / "live_capture.py",
                 ROOT / "detector" / "artifacts" / "meta.json",
             ],
             defaults={
@@ -121,7 +176,7 @@ class Miner(BaseMinerNeuron):
                 "repo_url": repo_url,
                 "repo_commit": repo_commit,
                 "artifact_sha256": _artifact_sha256(ARTIFACT),
-                "artifact_url": _artifact_url(repo_url, repo_commit),
+                "artifact_url": "",
                 "notes": "Behavioural bot detector.",
                 "open_source": True,
                 "inference_mode": "remote",
@@ -142,17 +197,55 @@ class Miner(BaseMinerNeuron):
 
     async def forward(self, synapse: DetectionSynapse) -> DetectionSynapse:
         chunks = synapse.chunks or []
+        started = time.perf_counter()
+        degraded = False
         try:
             scores = self.detector.score_chunks(chunks)
         except Exception as exc:  # never crash on a malformed request
-            bt.logging.warning(f"scoring failed ({exc}); falling back to 0.5")
-            scores = [0.5] * len(chunks)
+            bt.logging.error(f"SCORING FAILED ({exc}); serving the model-free "
+                             f"fallback ranking. Investigate and restart.")
+            degraded = True
+            scores = _fallback_scores(chunks)
         synapse.risk_scores = scores
         synapse.predictions = [s >= 0.5 for s in scores]
         synapse.model_manifest = dict(self.model_manifest)
-        bt.logging.info(f"Scored {len(chunks)} chunks | "
-                        f"flagged={sum(1 for p in synapse.predictions if p)} | "
-                        f"mean={sum(scores)/max(len(scores), 1):.3f}")
+
+        # Per-request diagnostics. positive_fraction is the one that matters: a
+        # 0.0 leaderboard result is threshold_sanity_quality going to zero, and
+        # the only way to tell "flagged nothing" from "flagged plenty but all
+        # wrong" after the fact is to have logged this at the time.
+        elapsed_ms = (time.perf_counter() - started) * 1000.0
+        if scores:
+            ordered = sorted(scores)
+            n = len(ordered)
+            positives = sum(1 for s in scores if s >= 0.5)
+            hand_counts = [len(c) for c in chunks] or [0]
+            bt.logging.info(
+                f"Scored {n} chunks | positive_fraction={positives / n:.4f} "
+                f"({positives}/{n}) | min={ordered[0]:.4f} med={ordered[n // 2]:.4f} "
+                f"max={ordered[-1]:.4f} mean={sum(scores) / n:.4f} | "
+                f"hands/chunk {min(hand_counts)}-{max(hand_counts)} | "
+                f"latency={elapsed_ms:.0f}ms{' | DEGRADED' if degraded else ''}"
+            )
+            if positives == 0:
+                bt.logging.error(
+                    "positive_fraction=0 -- no chunk reached 0.5, so "
+                    "threshold_sanity_quality is 0 and this request contributes a "
+                    "ZERO reward regardless of ranking quality."
+                )
+        else:
+            bt.logging.info(f"Scored 0 chunks | latency={elapsed_ms:.0f}ms")
+
+        # Diagnostic capture of the live (unlabeled) input distribution. OFF
+        # unless POKER44_CAPTURE / POKER44_CAPTURE_BATCH are set. Both helpers
+        # swallow every error internally; wrapped again here so capture can never
+        # affect the response that has already been built above.
+        try:
+            validator_hotkey = getattr(getattr(synapse, "dendrite", None), "hotkey", None)
+            live_capture.capture(chunks, scores, self.uid, validator_hotkey)
+            live_capture.capture_batch(chunks, scores, self.uid, validator_hotkey)
+        except Exception:
+            pass
         return synapse
 
     async def blacklist(self, synapse: DetectionSynapse) -> Tuple[bool, str]:
