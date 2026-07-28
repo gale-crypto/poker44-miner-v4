@@ -1,6 +1,10 @@
 # Miner runtime (mirrors pyproject.toml). Install the Poker44 subnet separately:
 #   pip install -e ../Poker44-subnet
 bittensor>=10.3,<11
+# Required by poker44/utils/encrypted_endpoints.py (curve25519 sealed boxes) for
+# opt-in encrypted Axon endpoint commitments. Import happens at miner startup
+# regardless of POKER44_ENCRYPTED_AXON_ENABLED, so it is not optional.
+PyNaCl>=1.5,<2
 pydantic>=2.6
 requests>=2.31
 python-dotenv>=1.0
