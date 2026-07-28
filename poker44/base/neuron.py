@@ -162,17 +162,78 @@ class BaseNeuron(ABC):
             bt.logging.error("If you use public RPC endpoint try to move to local node")
             time.sleep(5)
 
-    def check_registered(self):
-        # --- Check for registration.
-        if not self.subtensor.is_hotkey_registered(
-            netuid=self.config.netuid,
-            hotkey_ss58=self.wallet.hotkey.ss58_address,
-        ):
-            bt.logging.error(
-                f"Wallet: {self.wallet} is not registered on netuid {self.config.netuid}."
-                f" Please register the hotkey using `btcli subnets register` before trying again"
+    # is_hotkey_registered() returns False on a transient RPC failure, not just
+    # when the hotkey is genuinely absent. Observed on uid 130 and 248 within
+    # seconds of every start, while immediate follow-up probes returned
+    # registered 5/5 -- self.subtensor is shared with the axon and metagraph
+    # sync, and a concurrent call on that connection can come back False.
+    _REGISTRATION_PROBES = 3
+    _REGISTRATION_PROBE_DELAY = 2.0
+
+    def _hotkey_registered(self, subtensor=None):
+        """True/False from the chain, or None when the query itself failed.
+
+        Upstream cannot tell those apart -- an exception and a genuine "not
+        registered" both end up as a falsy result -- which is what makes the
+        failure mode indistinguishable from deregistration.
+        """
+        try:
+            return bool(
+                (subtensor or self.subtensor).is_hotkey_registered(
+                    netuid=self.config.netuid,
+                    hotkey_ss58=self.wallet.hotkey.ss58_address,
+                )
             )
-            exit()
+        except Exception as exc:
+            bt.logging.warning(f"Registration probe failed: {exc}")
+            return None
+
+    def check_registered(self):
+        """Confirm registration before believing a negative.
+
+        Upstream called exit() on the first False. run() executes in a
+        background thread, so that SystemExit killed only that thread: the axon
+        kept serving and pm2 kept reporting "online" while the sync loop was
+        dead and the metagraph silently went stale. A miner that cannot be
+        distinguished from a healthy one is worse than one that crashes.
+        """
+        for attempt in range(self._REGISTRATION_PROBES):
+            if self._hotkey_registered():
+                return
+            if attempt + 1 < self._REGISTRATION_PROBES:
+                time.sleep(self._REGISTRATION_PROBE_DELAY)
+
+        # Every probe on the shared connection said no. Before acting on that,
+        # ask over a connection nothing else is using.
+        fresh = None
+        try:
+            fresh = bt.Subtensor(config=self.config)
+            if self._hotkey_registered(fresh):
+                bt.logging.warning(
+                    "Registration probes failed on the shared subtensor connection "
+                    "but a fresh connection confirms the hotkey IS registered; "
+                    "continuing to serve."
+                )
+                return
+        except Exception as exc:
+            bt.logging.warning(f"Could not open a fresh subtensor connection: {exc}")
+        finally:
+            if fresh is not None:
+                try:
+                    fresh.close()
+                except Exception:
+                    pass
+
+        # Deliberately no exit(). If the hotkey really is deregistered the axon
+        # simply stops being queried, and staying up costs nothing; whereas
+        # tearing down on a false negative loses every round until someone
+        # notices. Logged as an error so it is still visible either way.
+        bt.logging.error(
+            f"Wallet: {self.wallet} appears NOT registered on netuid "
+            f"{self.config.netuid} after {self._REGISTRATION_PROBES} probes and a "
+            "fresh connection. If this is real, register the hotkey with "
+            "`btcli subnets register`. Continuing to serve in case it is not."
+        )
 
     def should_sync_metagraph(self):
         """
