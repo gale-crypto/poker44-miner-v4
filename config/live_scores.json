@@ -29,5 +29,29 @@
       "poker44-miner-v4": 0.5289
     },
     "diagnosis": "A no-signal model scores 0.525, so this build had essentially no live discrimination (implied AP ~0.51) while four peers ran at AP 0.62-0.70. Baseline for the scale-normalization, drift-policy, amount-bucket and positive-floor changes. Context only - never a per-example training label."
+  },
+  {
+    "competition_round": "Competition 7 R2",
+    "recorded_at": "2026-07-28",
+    "live_score": 0.5764,
+    "excess_over_floor": 0.0514,
+    "zeroed": false,
+    "variant": "v4-monoguard",
+    "model_version": "20260727-065022",
+    "artifact_sha256": "085e6d2b4061c972d14fdb7340d58b44265289a332fa78920e3ec040dac92e9f",
+    "feature_schema_sha256": "2dffb94809b093300f6b88033b9453cbf898272483584699210e7d13b995c769",
+    "config": {
+      "scale_norm": true,
+      "drift_policy": true,
+      "amount_bucket_fixed": true,
+      "positive_floor": true,
+      "max_pos_frac": 0.05,
+      "positive_fraction": null,
+      "sig_weight": 0.4
+    },
+    "offline_reward": 0.9216727046806236,
+    "reward_formula_version": "0.35*AP + 0.30*recall@fpr<=0.05 + 0.20*tsq + 0.10*tsq + 0.05",
+    "source": "user-reported Poker44 leaderboard",
+    "diagnosis": "First round on the transfer-fix build (amount_bucket fix, scale norm, drift policy, MAX_POS_FRAC 0.20->0.05, positive floor). Round 1 was 0.5289 = floor+0.0039; this is floor+0.0514."
   }
 ]
