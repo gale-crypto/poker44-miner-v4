@@ -205,7 +205,19 @@ class Miner(BaseMinerNeuron):
                 "repo_commit": repo_commit,
                 "artifact_sha256": _artifact_sha256(ARTIFACT),
                 "artifact_url": "",
-                "notes": "Behavioural bot detector.",
+                # Scope the open_source claim rather than leaving it to be read
+                # as broader than it is. Every file the manifest NAMES is in the
+                # public repo; the training pipeline and the weights are not, so
+                # say that plainly. artifact_sha256 is what lets a reader verify
+                # the served weights even though they are distributed
+                # out-of-band. A precise true claim is worth more than a broad
+                # one that invites an argument.
+                "notes": (
+                    "Behavioural bot detector. Inference path, feature pipeline "
+                    "and model metadata are published; the training pipeline is "
+                    "private and the weights are distributed out-of-band, "
+                    "identified by artifact_sha256."
+                ),
                 "open_source": True,
                 "inference_mode": "remote",
                 "training_data_statement": "Trained only on the public Poker44 benchmark.",
