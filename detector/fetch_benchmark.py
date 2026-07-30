@@ -91,6 +91,52 @@ def _count_labeled_examples(payload: dict[str, Any]) -> tuple[int, int]:
     return examples, hands
 
 
+def release_signature(payload: dict[str, Any]) -> tuple[str, str, str]:
+    """The corpus generation a release belongs to."""
+    return (str(payload.get("releaseVersion") or ""),
+            str(payload.get("schemaVersion") or ""),
+            str(payload.get("releaseType") or ""))
+
+
+def corpus_signatures(directory: Path) -> dict[tuple[str, str, str], list[str]]:
+    """Map each release generation on disk to the files that belong to it."""
+    found: dict[tuple[str, str, str], list[str]] = {}
+    for path in sorted(Path(directory).glob("release_*.json")):
+        try:
+            with open(path, encoding="utf-8") as handle:
+                payload = json.load(handle)
+        except Exception:
+            continue
+        found.setdefault(release_signature(payload), []).append(path.name)
+    return found
+
+
+def assert_single_generation(directory: Path) -> tuple[str, str, str]:
+    """Raise unless every release on disk comes from one corpus generation.
+
+    Poker44 v3.0 replaces the payload contract. If a v3-shaped release lands in
+    the same folder under the same release_<date>.json naming, nothing downstream
+    fails loudly: the trainers glob the whole directory, and the feature cache
+    keys on row count and feature schema, so it would happily invalidate and
+    rebuild over a mixture of two incompatible corpora. A silently poisoned
+    retrain is the worst possible outcome at a moment when we are trying to read
+    whether a change helped, so this stops instead.
+    """
+    signatures = corpus_signatures(directory)
+    if len(signatures) > 1:
+        detail = "; ".join(
+            f"{'/'.join(sig)}: {len(files)} file(s) e.g. {files[0]}"
+            for sig, files in sorted(signatures.items())
+        )
+        raise RuntimeError(
+            f"benchmark corpus at {directory} mixes {len(signatures)} release "
+            f"generations -- {detail}. Train on one generation at a time: move "
+            f"the older releases aside, or point POKER44_BENCHMARK_DIR at a "
+            f"separate folder per generation."
+        )
+    return next(iter(signatures), ("", "", ""))
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Download Poker44 benchmark releases (incremental).")
     parser.add_argument("--output-dir", type=str, default=str(DEFAULT_OUTPUT_DIR))
@@ -99,6 +145,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--force", action="store_true",
                         help="Re-download even if release_<date>.json already exists.")
     parser.add_argument("--chunk-limit", type=int, default=24, help="Chunks per API page (max 24).")
+    parser.add_argument("--allow-version-change", action="store_true",
+                        help="Save releases whose generation differs from what is "
+                             "already on disk. Off by default: v3.0 changes the "
+                             "payload contract, and mixing generations in one "
+                             "folder silently corrupts training.")
+    parser.add_argument("--verify", action="store_true",
+                        help="Report the release generations already on disk and exit.")
     return parser.parse_args()
 
 
@@ -107,9 +160,24 @@ def main() -> None:
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
+    on_disk = corpus_signatures(output_dir)
+    if args.verify:
+        if not on_disk:
+            print(f"no releases at {output_dir}")
+        for signature, files in sorted(on_disk.items()):
+            print(f"  {'/'.join(signature)}: {len(files)} release(s) "
+                  f"{files[0]}..{files[-1]}")
+        if len(on_disk) > 1:
+            raise SystemExit("MIXED GENERATIONS -- see --allow-version-change")
+        return
+    # One generation already on disk is the baseline any new release must match.
+    baseline = next(iter(on_disk)) if len(on_disk) == 1 else None
+
     status = _get_json(API_BASE)
     print("API corpus:", f"totalChunks={status.get('totalChunks')}",
           f"latestSourceDate={status.get('latestSourceDate')}")
+    if baseline:
+        print(f"on disk: {'/'.join(baseline)} ({len(on_disk[baseline])} releases)")
 
     dates = [d.strip() for d in (args.dates or "").split(",") if d.strip()] or list_all_release_dates()
     if not dates:
@@ -123,6 +191,16 @@ def main() -> None:
             continue
         try:
             payload = fetch_release(source_date, limit=args.chunk_limit)
+            signature = release_signature(payload)
+            if baseline and signature != baseline and not args.allow_version_change:
+                print(f"STOP: {source_date} is {'/'.join(signature)} but the corpus "
+                      f"on disk is {'/'.join(baseline)}. This is the v3.0 contract "
+                      f"change, not a transient error. Fetch it into a SEPARATE "
+                      f"directory (--output-dir / POKER44_BENCHMARK_DIR) so the two "
+                      f"generations are never trained on together, or pass "
+                      f"--allow-version-change if you are certain they are "
+                      f"compatible.")
+                break
             examples, hands = _count_labeled_examples(payload)
             if examples <= 0:
                 print(f"WARN: skipped {source_date}: no labeled examples")
