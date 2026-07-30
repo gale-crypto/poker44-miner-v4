@@ -197,6 +197,64 @@ def capture_batch(
         pass
 
 
+_sessions: Dict[str, Any] = {"path": None, "full": False, "seen": None, "written": 0}
+
+
+def capture_sessions(
+    sessions: Sequence[dict],
+    scores: Sequence[float],
+    miner_id: Any,
+    validator: Any,
+    *,
+    window_id: Any = None,
+) -> None:
+    """Append one JSONL record per NEW v3 subject session. Never raises.
+
+    Worth more than the v2 captures: there is no released v3 dataset, so until
+    one ships these payloads are the only v3 data in existence for us. Gated by
+    POKER44_CAPTURE like the rest, deduped by content hash, and subject to the
+    same size cap.
+    """
+    if not enabled() or _sessions["full"] or not sessions:
+        return
+    try:
+        _DIR.mkdir(parents=True, exist_ok=True)
+        if _sessions["path"] is None:
+            _sessions["path"] = _DIR / f"sessions_{str(miner_id)[:16]}.jsonl"
+        path: Path = _sessions["path"]
+        if path.exists() and path.stat().st_size >= _MAX_BYTES:
+            _sessions["full"] = True
+            return
+        if _sessions["seen"] is None:
+            _sessions["seen"] = _load_seen(path, "session")
+        seen: set = _sessions["seen"]
+
+        ts, vtag, uid = round(time.time(), 2), str(validator or "")[:8], str(miner_id)
+        lines: List[str] = []
+        for session, score in zip(sessions, scores):
+            if not isinstance(session, dict):
+                continue
+            key = _key(session)
+            if key in seen:
+                continue
+            seen.add(key)
+            try:
+                value = round(float(score), 6)
+            except (TypeError, ValueError):
+                value = None
+            lines.append(json.dumps(
+                {"t": ts, "v": vtag, "uid": uid, "w": str(window_id or ""),
+                 "sv": str(session.get("schema_version") or ""),
+                 "n": len(session.get("decisions") or session.get("hands") or []),
+                 "score": value, "session": session},
+                separators=(",", ":"), default=str,
+            ))
+        if lines:
+            _append(_sessions, path, "\n".join(lines) + "\n")
+    except Exception:
+        pass          # capture must NEVER affect serving
+
+
 def status() -> Dict[str, Any]:
     """One-line state for the miner log. A latched size cap must be visible."""
     return {
@@ -205,7 +263,8 @@ def status() -> Dict[str, Any]:
         "dir": str(_DIR),
         "chunk_records_written": _state["written"],
         "batch_records_written": _batch["written"],
-        "capped": bool(_state["full"] or _batch["full"]),
+        "session_records_written": _sessions["written"],
+        "capped": bool(_state["full"] or _batch["full"] or _sessions["full"]),
         "max_bytes": _MAX_BYTES,
     }
 

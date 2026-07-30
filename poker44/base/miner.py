@@ -35,7 +35,7 @@ from poker44.utils.encrypted_endpoints import (
     EndpointProtectionError,
     enable_miner_endpoint_protection,
 )
-from poker44.validator.synapse import DetectionSynapse
+from poker44.validator.synapse import DetectionSynapse, SessionDetectionSynapse
 
 from typing import Union
 
@@ -72,8 +72,19 @@ class BaseMinerNeuron(BaseNeuron):
             blacklist_fn = self.blacklist,
             priority_fn = self.priority,
         )
+        # Poker44 v3 sends SessionDetectionSynapse instead of DetectionSynapse.
+        # Bittensor routes on the class name, so an axon that has not attached
+        # this handler does not answer a v3 validator at all -- it is a missed
+        # request, not a degraded score. Both stay attached through the
+        # migration so we keep serving whichever version arrives.
+        self.axon.attach(
+            forward_fn = self.forward_session,
+            blacklist_fn = self.blacklist_session,
+            priority_fn = self.priority_session,
+        )
         if self.validator_hotkey_whitelist:
             self.axon.verify_fns[DetectionSynapse.__name__] = self.verify_validator_request
+            self.axon.verify_fns[SessionDetectionSynapse.__name__] = self.verify_validator_request
         # # self.axon.attach(
         #     forward_fn=self.forward_feedback,
         #     blacklist_fn=self.blacklist_feedback,

@@ -31,9 +31,11 @@ from poker44.base.miner import BaseMinerNeuron
 from poker44.utils.model_manifest import (build_local_model_manifest,
                                           evaluate_manifest_compliance,
                                           manifest_digest)
-from poker44.validator.synapse import DetectionSynapse
+from poker44.validator.synapse import (DetectionSynapse,
+                                       SessionDetectionSynapse,
+                                       validate_session_request)
 
-from detector import live_capture
+from detector import live_capture, session_v3
 from detector.inference import get_model
 
 MODEL_NAME = os.environ.get("POKER44_MODEL_NAME", "poker44-miner-v4")
@@ -193,6 +195,7 @@ class Miner(BaseMinerNeuron):
                 ROOT / "detector" / "inference.py",
                 ROOT / "detector" / "features.py",
                 ROOT / "detector" / "signature.py",
+                ROOT / "detector" / "session_v3.py",
                 ROOT / "detector" / "live_capture.py",
                 ROOT / "detector" / "artifacts" / "meta.json",
             ],
@@ -297,6 +300,82 @@ class Miner(BaseMinerNeuron):
         return self.common_blacklist(synapse)
 
     async def priority(self, synapse: DetectionSynapse) -> float:
+        return self.caller_priority(synapse)
+
+    # ----------------------------------------------------------------- v3 --
+    async def forward_session(
+        self, synapse: SessionDetectionSynapse
+    ) -> SessionDetectionSynapse:
+        """Serve the Poker44 v3 subject-session contract.
+
+        Deliberately more forgiving than the reference miner, which raises on a
+        failed validation. Raising returns no risk_scores at all, and the
+        validator counts that as a non-response; a best-effort answer is worth
+        strictly more than silence, so the failure is logged and serving
+        continues.
+        """
+        sessions = synapse.sessions or []
+        started = time.perf_counter()
+        try:
+            validate_session_request(synapse)
+        except ValueError as exc:
+            bt.logging.warning(
+                f"v3 request failed validation ({exc}); serving best-effort scores.")
+
+        degraded = False
+        try:
+            scores = session_v3.score_sessions(
+                sessions, legacy_batch_scorer=self.detector.score_chunks)
+        except Exception as exc:
+            bt.logging.error(f"v3 SCORING FAILED ({exc}); serving 0.5 for every "
+                             f"session. Investigate and restart.")
+            degraded = True
+            scores = [0.5] * len(sessions)
+
+        # A length mismatch makes the validator discard the whole response, so
+        # the count is enforced here rather than trusted from the scorer.
+        if len(scores) != len(sessions):
+            bt.logging.error(f"v3 score count {len(scores)} != {len(sessions)} "
+                             f"sessions; padding to keep the response valid.")
+            scores = (list(scores) + [0.5] * len(sessions))[:len(sessions)]
+
+        synapse.risk_scores = [float(s) for s in scores]
+        synapse.predictions = [s >= 0.5 for s in scores]
+        synapse.model_version = str(self.model_manifest.get("model_version", ""))
+
+        elapsed_ms = (time.perf_counter() - started) * 1000.0
+        if scores:
+            ordered = sorted(scores)
+            n = len(ordered)
+            schemas = sorted({str(s.get("schema_version"))
+                              for s in sessions if isinstance(s, dict)})
+            bt.logging.info(
+                f"Scored {n} sessions | schema={','.join(schemas)} "
+                f"protocol={synapse.protocol_version} window={synapse.window_id} "
+                f"| min={ordered[0]:.4f} med={ordered[n // 2]:.4f} "
+                f"max={ordered[-1]:.4f} mean={sum(scores) / n:.4f} "
+                f"| positive_fraction={sum(1 for s in scores if s >= 0.5) / n:.4f} "
+                f"| latency={elapsed_ms:.0f}ms{' | DEGRADED' if degraded else ''}")
+        else:
+            bt.logging.info(f"Scored 0 sessions | latency={elapsed_ms:.0f}ms")
+
+        # v3 payloads are the only v3 data that exists for us -- there is no
+        # released dataset yet -- so capture is worth more here than on v2.
+        try:
+            validator_hotkey = getattr(getattr(synapse, "dendrite", None), "hotkey", None)
+            live_capture.capture_sessions(
+                sessions, scores, self.uid, validator_hotkey,
+                window_id=synapse.window_id)
+        except Exception:
+            pass
+        return synapse
+
+    async def blacklist_session(
+        self, synapse: SessionDetectionSynapse
+    ) -> Tuple[bool, str]:
+        return self.common_blacklist(synapse)
+
+    async def priority_session(self, synapse: SessionDetectionSynapse) -> float:
         return self.caller_priority(synapse)
 
 
