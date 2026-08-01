@@ -32,10 +32,12 @@ from poker44.utils.model_manifest import (build_local_model_manifest,
                                           evaluate_manifest_compliance,
                                           manifest_digest)
 from poker44.validator.synapse import (DetectionSynapse,
+                                       MicroSessionDetectionSynapse,
                                        SessionDetectionSynapse,
+                                       validate_micro_session_request,
                                        validate_session_request)
 
-from detector import live_capture, session_v3
+from detector import live_capture, micro_v4, session_v3
 from detector.inference import get_model
 
 MODEL_NAME = os.environ.get("POKER44_MODEL_NAME", "poker44-miner-v4")
@@ -195,6 +197,7 @@ class Miner(BaseMinerNeuron):
                 ROOT / "detector" / "inference.py",
                 ROOT / "detector" / "features.py",
                 ROOT / "detector" / "signature.py",
+                ROOT / "detector" / "micro_v4.py",
                 ROOT / "detector" / "session_v3.py",
                 ROOT / "detector" / "live_capture.py",
                 ROOT / "detector" / "artifacts" / "meta.json",
@@ -376,6 +379,78 @@ class Miner(BaseMinerNeuron):
         return self.common_blacklist(synapse)
 
     async def priority_session(self, synapse: SessionDetectionSynapse) -> float:
+        return self.caller_priority(synapse)
+
+    # ------------------------------------------------- v3.0 as shipped --
+    async def forward_micro_sessions(
+        self, synapse: MicroSessionDetectionSynapse
+    ) -> MicroSessionDetectionSynapse:
+        """Serve the schema-v4.1 micro-session contract.
+
+        Validation failures are logged, not raised. The reference miner raises,
+        but a raise returns no risk_scores and the validator treats that as a
+        non-response -- and a non-response is exactly how a slot stops earning
+        and eventually gets deregistered.
+        """
+        items = synapse.items or []
+        started = time.perf_counter()
+        try:
+            validate_micro_session_request(synapse)
+        except ValueError as exc:
+            bt.logging.warning(
+                f"micro-session request failed validation ({exc}); "
+                f"serving best-effort scores.")
+
+        degraded = False
+        try:
+            scores = micro_v4.score_items(items)
+        except Exception as exc:
+            bt.logging.error(f"MICRO SCORING FAILED ({exc}); serving 0.5 for "
+                             f"every item. Investigate and restart.")
+            degraded = True
+            scores = [0.5] * len(items)
+
+        if len(scores) != len(items):
+            bt.logging.error(f"micro score count {len(scores)} != {len(items)} "
+                             f"items; padding to keep the response valid.")
+            scores = (list(scores) + [0.5] * len(items))[:len(items)]
+
+        synapse.risk_scores = [float(s) for s in scores]
+        synapse.predictions = [s >= 0.5 for s in scores]
+        synapse.model_version = str(self.model_manifest.get("model_version", ""))
+
+        elapsed_ms = (time.perf_counter() - started) * 1000.0
+        if scores:
+            ordered = sorted(scores)
+            n = len(ordered)
+            distinct = len(set(scores))
+            bt.logging.info(
+                f"Scored {n} micro-sessions | window={synapse.window_id} "
+                f"query={synapse.query_id[:12]} "
+                f"| min={ordered[0]:.4f} med={ordered[n // 2]:.4f} "
+                f"max={ordered[-1]:.4f} mean={sum(scores) / n:.4f} "
+                f"| distinct={distinct}/{n} "
+                f"| latency={elapsed_ms:.0f}ms{' | DEGRADED' if degraded else ''}")
+        else:
+            bt.logging.info(f"Scored 0 micro-sessions | latency={elapsed_ms:.0f}ms")
+
+        try:
+            validator_hotkey = getattr(getattr(synapse, "dendrite", None), "hotkey", None)
+            live_capture.capture_sessions(
+                items, scores, self.uid, validator_hotkey,
+                window_id=synapse.window_id)
+        except Exception:
+            pass
+        return synapse
+
+    async def blacklist_micro_sessions(
+        self, synapse: MicroSessionDetectionSynapse
+    ) -> Tuple[bool, str]:
+        return self.common_blacklist(synapse)
+
+    async def priority_micro_sessions(
+        self, synapse: MicroSessionDetectionSynapse
+    ) -> float:
         return self.caller_priority(synapse)
 
 

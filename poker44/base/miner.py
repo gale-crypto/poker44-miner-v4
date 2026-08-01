@@ -35,7 +35,9 @@ from poker44.utils.encrypted_endpoints import (
     EndpointProtectionError,
     enable_miner_endpoint_protection,
 )
-from poker44.validator.synapse import DetectionSynapse, SessionDetectionSynapse
+from poker44.validator.synapse import (DetectionSynapse,
+                                       MicroSessionDetectionSynapse,
+                                       SessionDetectionSynapse)
 
 from typing import Union
 
@@ -82,9 +84,20 @@ class BaseMinerNeuron(BaseNeuron):
             blacklist_fn = self.blacklist_session,
             priority_fn = self.priority_session,
         )
+        # Poker44 v3.0 as SHIPPED (subnet 0.2.1). The dev branch advertised
+        # SessionDetectionSynapse; production sends MicroSessionDetectionSynapse
+        # with `items` of schema 4.1. Routing is by class name, so without this
+        # attach the miner is never called at all -- which is what "incompatible
+        # or unavailable axon" means on the dashboard.
+        self.axon.attach(
+            forward_fn = self.forward_micro_sessions,
+            blacklist_fn = self.blacklist_micro_sessions,
+            priority_fn = self.priority_micro_sessions,
+        )
         if self.validator_hotkey_whitelist:
             self.axon.verify_fns[DetectionSynapse.__name__] = self.verify_validator_request
             self.axon.verify_fns[SessionDetectionSynapse.__name__] = self.verify_validator_request
+            self.axon.verify_fns[MicroSessionDetectionSynapse.__name__] = self.verify_validator_request
         # # self.axon.attach(
         #     forward_fn=self.forward_feedback,
         #     blacklist_fn=self.blacklist_feedback,
