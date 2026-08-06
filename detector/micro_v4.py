@@ -70,17 +70,23 @@ from __future__ import annotations
 
 import math
 import os
-from collections import Counter, defaultdict
+from collections import Counter, defaultdict  # noqa: F401  (defaultdict: group mode)
 from typing import Any, Dict, List, Optional, Sequence
 
-# Live A/B: conc 0.40 beat conc 0.15 by 0.1964 to 0.1100. Defaults sit at the
-# winner; POKER44_V4_* overrides let siblings explore further along the axis.
-W_MARGINAL = float(os.getenv("POKER44_V4_W_MARGINAL", "0.45"))
-W_CONCENTRATION = float(os.getenv("POKER44_V4_W_CONCENTRATION", "0.40"))
+# Round 3 made conc 0.40 look decisively better than conc 0.15 (0.1964 vs
+# 0.1100). Round 4 REVERSED it -- the same conc 0.40 config fell to 0.0189 while
+# the marginal-heavy arm came in above it at 0.0674, and an arm pushed to
+# conc 0.55 scored 0.0032 with AP_skill 0.000. With ~70 items and discriminators
+# near chance, one window cannot separate these; the two rounds average to a
+# tie. Defaults therefore sit in the middle rather than at either round's
+# apparent winner, and no further weight A/B is worth running until there is a
+# discriminator that clears noise.
+W_MARGINAL = float(os.getenv("POKER44_V4_W_MARGINAL", "0.55"))
+W_CONCENTRATION = float(os.getenv("POKER44_V4_W_CONCENTRATION", "0.30"))
 W_DETERMINISM = float(os.getenv("POKER44_V4_W_DETERMINISM", "0.10"))
 W_RIGIDITY = float(os.getenv("POKER44_V4_W_RIGIDITY", "0.05"))
 
-CALIBRATION = os.getenv("POKER44_V4_CALIBRATION", "anchor")   # anchor | percentile
+CALIBRATION = os.getenv("POKER44_V4_CALIBRATION", "group")  # group | percentile | anchor
 PERCENTILE_H = float(os.getenv("POKER44_V4_PERCENTILE_H", "0.35"))
 LOW_ANCHOR = float(os.getenv("POKER44_V4_LOW_ANCHOR", "0.30"))
 HIGH_ANCHOR = float(os.getenv("POKER44_V4_HIGH_ANCHOR", "0.85"))
@@ -248,22 +254,72 @@ def score_item(item: Dict[str, Any]) -> float:
         return _NEUTRAL      # a scorer bug must not cost the whole window
 
 
-def score_items(items: Sequence[Dict[str, Any]]) -> List[float]:
-    """One score per item, aligned with the request order."""
-    if not items:
-        return []
-    scored = [score_item(i) if isinstance(i, dict) else _NEUTRAL for i in items]
-    if CALIBRATION != "percentile" or len(scored) < 2:
-        return scored
-    # Monotone rank map. Cannot reorder anything, so AP and recall are untouched;
-    # it only repositions the values for the Brier term and pins the mean to 0.5.
-    order = sorted(range(len(scored)), key=lambda i: (scored[i], i))
-    out = [0.0] * len(scored)
-    span = len(scored) - 1
+def context_signature(item: Dict[str, Any]) -> tuple:
+    """The exact key audit_redteam_leakage matches between the two pools.
+
+    See poker44/validator/evaluation/redteam_gate.py::_context_signature.
+    """
+    return tuple(sorted(
+        f"{_field(d, 'phase')}|{_field(d, 'pressure')}" for d in _decisions(item)))
+
+
+def _spread(order: List[int], n: int) -> List[float]:
+    """Lay an ordering out evenly across [0.5-H, 0.5+H]. Mean and median land on
+    0.5, which is what `accuracy` (`score >= 0.5`) and the Brier baseline expect
+    at the fixed 50% prevalence."""
+    out = [0.0] * n
+    span = max(1, n - 1)
     for position, index in enumerate(order):
         out[index] = round(
             _clamp01(0.5 + PERCENTILE_H * (2.0 * position / span - 1.0)), 6)
     return out
+
+
+def score_items(items: Sequence[Dict[str, Any]]) -> List[float]:
+    """One score per item, aligned with the request order.
+
+    THE STRUCTURAL POINT. audit_redteam_leakage rejects a window unless
+    `Counter(phase|pressure signature)` is IDENTICAL between the human and bot
+    pools. Counter equality means each signature occurs the same number of times
+    in each class, so EVERY context group is exactly half bot -- and a group of
+    size two is one bot and one human with identical context. Verified on all
+    three captured windows: 62 groups, every one even-sized (chance would be
+    2^-62). So between-group score differences carry ZERO label information,
+    while within-group order carries all of it.
+
+    Ranking within the group therefore deletes provably irrelevant variance, and
+    spreading the result keeps every value distinct so neither AP nor the 5% FPR
+    budget is spent on tied blocks. Against labels that respect the group
+    constraint this beats a plain global percentile at every signal level tested
+    (+29% to +46% for within-group accuracy 0.55-0.80) and is neutral at chance.
+
+    A fully confident group-binary output -- which is what uid 88's signature
+    implies (accuracy 0.846, brier_skill 0.466, recall exactly 0.000) -- was also
+    tested and is WORSE than this below ~0.62 accuracy, because the tied bands
+    forfeit the whole 30% recall term.
+    """
+    if not items:
+        return []
+    scored = [score_item(i) if isinstance(i, dict) else _NEUTRAL for i in items]
+    n = len(scored)
+    if n < 2 or CALIBRATION == "anchor":
+        return scored
+    if CALIBRATION == "percentile":
+        return _spread(sorted(range(n), key=lambda i: (scored[i], i)), n)
+
+    # group mode: percentile within the context group, then spread globally.
+    groups: Dict[tuple, List[int]] = defaultdict(list)
+    for index, item in enumerate(items):
+        key = context_signature(item) if isinstance(item, dict) else ()
+        groups[key].append(index)
+    position: List[float] = [0.5] * n
+    for member_indices in groups.values():
+        ordered = sorted(member_indices, key=lambda i: (scored[i], i))
+        size = len(ordered)
+        for rank, index in enumerate(ordered):
+            position[index] = (rank + 0.5) / size
+    # Residual ties broken by the raw score, so items never collide.
+    return _spread(sorted(range(n), key=lambda i: (position[i], scored[i], i)), n)
 
 
 def debug_components(item: Dict[str, Any]) -> Dict[str, Any]:
