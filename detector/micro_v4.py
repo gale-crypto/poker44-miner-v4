@@ -1,66 +1,70 @@
-"""Scoring for the Poker44 schema-v4.1 micro-session contract (subnet 0.2.1).
+"""Scoring for the Poker44 schema-v4.1 micro-session contract.
 
-REWRITTEN 2026-08-04 after round 3. Round-by-round, measured on live windows:
+HISTORY, measured on live windows -- read this before changing weights.
 
-  round 2 (88 items)  ours 0.2366  vs the 71-miner stock tie 0.2432   -0.0066
-  round 3 (70 items)  ours 0.1300  vs the 77-miner stock tie 0.0830   +0.0470
+  round 2  ours 0.2366  vs the 71-miner stock tie 0.2432   -0.0066  rank 78
+  round 3  ours 0.1300  vs the 77-miner stock tie 0.0830   +0.0470  rank 35
+  round 4  all four of our arms at brier_skill 0.000, accuracy 0.45-0.52
 
-So the round-2 rebuild worked -- rank 78 -> 35. But round 3 also ran a
-controlled A/B on two sibling miners, identical code, weights the only
-difference, and it beat us:
+WHAT DID NOT SURVIVE CONTACT. Round 3 ran a controlled A/B -- identical code,
+weights the only difference -- and `conc 0.40` beat `conc 0.15` by 0.1964 to
+0.1100, which looked like proof that policy CONCENTRATION beats MARGINAL action
+composition. Round 4 reversed it exactly: the same conc 0.40 config fell to
+0.0189 (rank 177) while the marginal-heavy arm came in above it at 0.0674, and
+an arm pushed to conc 0.55 scored 0.0032 with AP_skill 0.000. With ~70 items and
+discriminators sitting near chance, one window cannot separate these configs.
+Weights are therefore parked in the middle and no further weight A/B is worth
+running until some discriminator clears the noise floor.
 
-  uid 154  marg 0.45 / conc 0.40 / det 0.10 / size 0.05   0.1964  rank 6
-  uid 130  reference-model backbone (this file, round 2)  0.1300  rank 35
-  uid 248  marg 0.75 / conc 0.15 / det 0.05 / size 0.05   0.1100  rank 64
+The subnet owner has since stated the opposing agents are "not bots based on
+static decisions: they are agents with dynamic logic and multiple behavioral
+profiles". That is the likely reason every repetition-based feature has failed:
+concentration and conditional determinism were built to catch a scripted seat,
+and there is no scripted seat to catch.
 
-Shifting weight from MARGINAL action composition to POLICY CONCENTRATION nearly
-doubled the score. That is a direct live measurement, and it outranks the
-simulation the round-2 version was tuned against. The reference model is pure
-marginal composition, so the round-2 backbone was sitting at the wrong end of
-exactly this axis.
+WHAT THE VALIDATOR GUARANTEES, AND WHAT IT COSTS. audit_redteam_leakage()
+rejects a window unless `Counter(phase|pressure signature)` is IDENTICAL between
+the human and bot pools, position_group agrees within 15pp, and decision_count /
+postflop / facing_bet / context-variety all fail to separate the classes. So
+every context-shape feature is non-discriminative BY CONSTRUCTION, and -- because
+Counter equality forces each signature to appear equally often in each class --
+EVERY context group is exactly half bot. Verified across all captured windows:
+every group even-sized, which chance would not produce.
 
-WHY CONCENTRATION IS THE RIGHT AXIS. audit_redteam_leakage() forces the multiset
-of `phase|pressure` signatures to be IDENTICAL between the human and bot pools
-and position_group to agree within 15pp, so context composition is
-non-discriminative by construction. What survives is which action was chosen in
-a given context -- and a scripted seat answers the same context the same way and
-repeats whole decision tuples, while a person's conditional action distribution
-stays varied. Marginal rates blur that; concentration measures it directly.
+THE THREE LAYERS.
 
-WHAT THIS FILE KEEPS FROM ROUND 2. Two mechanical properties that are
-independent of which features drive the ranking, and that the A/B winner does
-not have:
+  1. RAW SIGNAL -- marginal action composition (the subnet's own reference model,
+     the only feature family with any demonstrated skill), plus tuple
+     concentration, conditional action entropy and size rigidity. Every term
+     contributes against a FIXED denominator with an absent term falling back to
+     the neutral 0.5. Renormalising onto the terms that happen to be defined is
+     what inverted the round-2 signal, and the reference _v41 scorer still has
+     that defect.
 
-  * TIE-BREAK. The winning scorer emits only 34 distinct values on 70 items,
-    with a 7-item block. Ties are the most expensive thing in this reward: a
-    fully tied vector scores exactly 0.0000, `average_precision_score` degrades
-    on them, and `_recall_at_fpr` consumes an entire equally-scored block before
-    testing the 5% FPR budget. Because that function accumulates `best_recall`
-    as a MAX over the thresholds it visits, splitting a block only ADDS
-    thresholds without moving the ones already there -- so recall@FPR<=0.05 is
-    monotonically non-decreasing under any tie-break, informative or not. This
-    is a guarantee, not a hope.
-  * NO WEIGHT RENORMALISATION. The round-2 version divided by the weight of the
-    terms that happened to be defined, which inverted the signal: the dropped
-    term was present precisely on the aggressive items, so the passive ones got
-    their surviving terms multiplied by 1.25. The A/B winner has the same defect
-    (`wtot = sum(w for w, _ in terms)`). Here every term contributes against a
-    FIXED denominator, with an absent term falling back to the neutral 0.5.
+  2. TIE-BREAK -- content-derived, never item_id (see _tiebreak). Ties are the
+     most expensive thing in this reward: a fully tied vector scores exactly
+     0.0000. Because `_recall_at_fpr` accumulates best_recall as a MAX over the
+     thresholds it visits, splitting a tied block only ADDS thresholds, so
+     recall@FPR<=0.05 is monotonically non-decreasing under any tie-break. That
+     is a guarantee. Note it is doing heavy lifting: ~43 of 70 items typically
+     share a raw score, so the discriminator's resolution, not the tie-break, is
+     the real limitation.
 
-CALIBRATION. The reward's Brier component is `max(0, 1 - brier/baseline)` with
-prevalence 0.5 (pools are built 44/44, 35/35), so a miscentred or narrow band
-forfeits it -- round 2 measured our own ceiling at brier_skill 0.113 even with a
-PERFECT ranking. Two modes are provided. `percentile` maps rank onto
-[0.5-H, 0.5+H]; being monotone it cannot change AP or recall by one item, and it
-guarantees mean 0.5. `anchor` keeps the raw signal's shape, which earns more
-Brier when the extremes are genuinely confident. Default is `anchor` because the
-A/B winner uses it and already lands well centred (mean 0.5059, range
-0.156-0.845); percentile is one env var away.
+  3. CALIBRATION -- default `group`: rank within the context group, then spread
+     smoothly across the whole window. Between-group differences are provably
+     label-irrelevant (layer 0 above) so ranking within the group deletes noise,
+     and spreading keeps values distinct. It also pins the median to 0.5, which
+     matters because `accuracy` is scored as `(score >= 0.5) == truth` at
+     prevalence 0.5 -- the previous `anchor` default put 74.3% of scores above
+     0.5 and thereby forced accuracy to chance and brier_skill to 0. Against
+     labels respecting the group constraint this beats a plain global percentile
+     at every signal level tested and is neutral at chance. `percentile` and
+     `anchor` remain available via POKER44_V4_CALIBRATION.
 
-Zero fitted parameters -- there is still no labelled v4.1 corpus in existence
-(all benchmark/training routes return ROUTE_NOT_FOUND as of 2026-08-04). Every
-weight is env-overridable so sibling miners can keep running the A/B forward
-rather than converging on one guess.
+Zero fitted parameters: no labelled v4.1 corpus exists yet (every benchmark and
+training route returns ROUTE_NOT_FOUND). The owner has said ground truth for
+used evaluation datasets will be published, at which point this file should be
+refitted rather than reasoned about.
 
 Contract: ``score_items(items) -> list[float]``, one score per item in [0, 1],
 aligned with the request order, higher == more bot-like.
@@ -209,15 +213,29 @@ def raw_score(decisions: List[Dict[str, Any]]) -> float:
     return _clamp01(blended)
 
 
-def _tiebreak(decisions: List[Dict[str, Any]], item_id: str) -> float:
+def _tiebreak(decisions: List[Dict[str, Any]]) -> float:
     """Deterministic splitter in [0, 1) for items identical on every term above.
 
-    Not signal. Stable across processes -- hash() is salted per run, so a rolling
-    polynomial is used instead.
+    CONTENT ONLY -- item_id is deliberately excluded. On 2026-08-07 the validator
+    sent the same 70 sessions four times (`..._r5` through `..._r8`) with 70/70
+    identical decision content but ZERO item_id overlap: ids are regenerated per
+    window and carry no information. Feeding them in made us score identical
+    sessions differently across those replays -- only 50-58 of 66 matched
+    sessions scored the same, drifting up to 0.28 -- because the tie-break
+    decides within-group rank and rank drives the final spread.
+
+    That drift was pure noise, and it also blocked learning: with ground truth
+    for used datasets due to be published, identical input must give identical
+    output or a replayed window cannot be compared against its own label.
+
+    Not signal either way; the ordering it imposes on raw-score ties is arbitrary
+    whichever key is used. The point is that it is now reproducible. Stable
+    across processes -- hash() is salted per run, so a rolling polynomial is used.
     """
     digest = 0
-    material = (item_id or "") + "|".join(
+    material = "|".join(
         _field(d, "action_type") + _field(d, "size_bucket") + _field(d, "phase")
+        + _field(d, "position_group") + _field(d, "pressure")
         for d in decisions
     )
     for character in material:
@@ -248,7 +266,7 @@ def score_item(item: Dict[str, Any]) -> float:
             return _NEUTRAL
         raw = raw_score(decisions)
         out = _anchor_calibrate(raw)
-        out += (_tiebreak(decisions, str(item.get("item_id") or "")) - 0.5) * TIEBREAK_AMPLITUDE
+        out += (_tiebreak(decisions) - 0.5) * TIEBREAK_AMPLITUDE
         return round(_clamp01(out), 6)
     except Exception:
         return _NEUTRAL      # a scorer bug must not cost the whole window
