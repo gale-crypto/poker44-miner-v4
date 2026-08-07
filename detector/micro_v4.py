@@ -101,6 +101,21 @@ CEILING = float(os.getenv("POKER44_V4_CEILING", "0.98"))
 # tie-break only ever reorders within a block.
 TIEBREAK_AMPLITUDE = float(os.getenv("POKER44_V4_TIEBREAK", "0.0015"))
 
+# What drives the ranking: the hand-built feature blend, the fitted mixture
+# likelihood ratio, or an average. Default stays `features` -- the mixture is a
+# measured bet (real structure at z=+3.44, but 0.763 agreement with a plain
+# aggression split) and is enabled per-miner so one arm can test it live.
+RAW_MODE = os.getenv("POKER44_V4_RAW", "features")          # features|mixture|blend
+MIXTURE_BLEND = float(os.getenv("POKER44_V4_MIXTURE_BLEND", "0.5"))
+
+try:                                    # package import when run as detector.micro_v4
+    from detector import mixture as _mixture
+except Exception:                       # loaded by path (tests) or artifact absent
+    try:
+        import mixture as _mixture      # noqa: F401
+    except Exception:
+        _mixture = None
+
 _VOLUNTARY = frozenset({"bet", "raise", "all_in"})
 _REAL_SIZE = frozenset({"third_pot_or_less", "half_pot", "three_quarter_pot",
                         "pot", "overbet", "all_in"})
@@ -197,8 +212,47 @@ def _marginal(decisions: List[Dict[str, Any]]) -> float:
                     + 0.20 * overbets + 0.14 * (1.0 - passive))
 
 
+def _mixture_raw(decisions: List[Dict[str, Any]]) -> Optional[float]:
+    """Logistic-squashed likelihood ratio from detector/mixture.py, or None.
+
+    The ratio is unbounded; the squash only puts it on the [0, 1] scale the rest
+    of this module expects. Under `group`/`percentile` calibration the final
+    score is rank-based, so the squash cannot change the ordering.
+    """
+    if _mixture is None:
+        return None
+    try:
+        ratio = _mixture.score_raw(decisions)
+    except Exception:
+        return None
+    if ratio is None:
+        return None
+    if ratio > 30.0:
+        return 1.0
+    if ratio < -30.0:
+        return 0.0
+    return 1.0 / (1.0 + math.exp(-ratio))
+
+
 def raw_score(decisions: List[Dict[str, Any]]) -> float:
-    """Blended policy signal in [0, 1]. FIXED denominator, neutral fill."""
+    """Policy signal in [0, 1]. FIXED denominator, neutral fill.
+
+    RAW_MODE selects what drives the ranking. `features` is the hand-built blend;
+    `mixture` is the fitted likelihood ratio; `blend` averages them. Any mixture
+    failure -- missing artifact, unreadable tables -- silently falls back to the
+    feature blend, so a bad artifact degrades the score rather than the window.
+    """
+    if RAW_MODE in ("mixture", "blend"):
+        squashed = _mixture_raw(decisions)
+        if squashed is not None:
+            if RAW_MODE == "mixture":
+                return _clamp01(squashed)
+            return _clamp01((1.0 - MIXTURE_BLEND) * _feature_raw(decisions)
+                            + MIXTURE_BLEND * squashed)
+    return _feature_raw(decisions)
+
+
+def _feature_raw(decisions: List[Dict[str, Any]]) -> float:
     determinism = _determinism(decisions)
     rigidity = _rigidity(decisions)
     total = W_MARGINAL + W_CONCENTRATION + W_DETERMINISM + W_RIGIDITY
@@ -258,14 +312,37 @@ def _anchor_calibrate(raw: float) -> float:
     return min(CEILING, _clamp01(out))
 
 
-def score_item(item: Dict[str, Any]) -> float:
-    """Score one schema-v4.1 micro-session. Never raises."""
+def ordering_key(item: Dict[str, Any]) -> float:
+    """Raw signal plus tie-break, with NO anchor squash. Never raises.
+
+    This is what `group` and `percentile` rank by. _anchor_calibrate is
+    deliberately not applied here: it is flat at CEILING above HIGH_ANCHOR and
+    flat toward FLOOR below LOW_ANCHOR, so ranking a saturated value throws away
+    real ordering. That was latent while the feature blend rarely left
+    [0.30, 0.85], but the mixture's logistic routinely does, and every saturated
+    item would otherwise collapse into one tie decided by the tie-break alone.
+    """
     try:
         decisions = _decisions(item)
         if not decisions:
             return _NEUTRAL
-        raw = raw_score(decisions)
-        out = _anchor_calibrate(raw)
+        return (raw_score(decisions)
+                + (_tiebreak(decisions) - 0.5) * TIEBREAK_AMPLITUDE)
+    except Exception:
+        return _NEUTRAL
+
+
+def score_item(item: Dict[str, Any]) -> float:
+    """Anchor-calibrated score for one micro-session. Never raises.
+
+    Used directly only under CALIBRATION=anchor; the rank-based modes use
+    ordering_key so they never rank a saturated value.
+    """
+    try:
+        decisions = _decisions(item)
+        if not decisions:
+            return _NEUTRAL
+        out = _anchor_calibrate(raw_score(decisions))
         out += (_tiebreak(decisions) - 0.5) * TIEBREAK_AMPLITUDE
         return round(_clamp01(out), 6)
     except Exception:
@@ -318,26 +395,28 @@ def score_items(items: Sequence[Dict[str, Any]]) -> List[float]:
     """
     if not items:
         return []
-    scored = [score_item(i) if isinstance(i, dict) else _NEUTRAL for i in items]
-    n = len(scored)
-    if n < 2 or CALIBRATION == "anchor":
-        return scored
+    n = len(items)
+    if CALIBRATION == "anchor":
+        return [score_item(i) if isinstance(i, dict) else _NEUTRAL for i in items]
+    # Rank on the UNSQUASHED signal -- see ordering_key.
+    key = [ordering_key(i) if isinstance(i, dict) else _NEUTRAL for i in items]
+    if n < 2:
+        return [round(_NEUTRAL, 6)] * n
     if CALIBRATION == "percentile":
-        return _spread(sorted(range(n), key=lambda i: (scored[i], i)), n)
+        return _spread(sorted(range(n), key=lambda i: (key[i], i)), n)
 
     # group mode: percentile within the context group, then spread globally.
     groups: Dict[tuple, List[int]] = defaultdict(list)
     for index, item in enumerate(items):
-        key = context_signature(item) if isinstance(item, dict) else ()
-        groups[key].append(index)
+        groups[context_signature(item) if isinstance(item, dict) else ()].append(index)
     position: List[float] = [0.5] * n
     for member_indices in groups.values():
-        ordered = sorted(member_indices, key=lambda i: (scored[i], i))
+        ordered = sorted(member_indices, key=lambda i: (key[i], i))
         size = len(ordered)
         for rank, index in enumerate(ordered):
             position[index] = (rank + 0.5) / size
-    # Residual ties broken by the raw score, so items never collide.
-    return _spread(sorted(range(n), key=lambda i: (position[i], scored[i], i)), n)
+    # Residual ties broken by the ordering key, so items never collide.
+    return _spread(sorted(range(n), key=lambda i: (position[i], key[i], i)), n)
 
 
 def debug_components(item: Dict[str, Any]) -> Dict[str, Any]:

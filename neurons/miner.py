@@ -198,6 +198,8 @@ class Miner(BaseMinerNeuron):
                 ROOT / "detector" / "features.py",
                 ROOT / "detector" / "signature.py",
                 ROOT / "detector" / "micro_v4.py",
+                ROOT / "detector" / "mixture.py",
+                ROOT / "detector" / "artifacts" / "mixture_v1.json",
                 ROOT / "detector" / "session_v3.py",
                 ROOT / "detector" / "live_capture.py",
                 ROOT / "detector" / "artifacts" / "meta.json",
