@@ -1,0 +1,168 @@
+{
+ "action_given_context": [
+  {
+   "flop|facing_bet": {
+    "all_in": 5,
+    "call": 42,
+    "raise": 6
+   },
+   "flop|no_call": {
+    "bet": 17,
+    "check": 30,
+    "fold": 42
+   },
+   "preflop|facing_bet": {
+    "all_in": 5,
+    "call": 252,
+    "raise": 17
+   },
+   "preflop|no_call": {
+    "check": 26,
+    "fold": 84,
+    "raise": 8
+   },
+   "river|facing_bet": {
+    "call": 7,
+    "raise": 3
+   },
+   "river|no_call": {
+    "bet": 2,
+    "check": 9,
+    "fold": 4
+   },
+   "turn|facing_bet": {
+    "call": 6,
+    "raise": 7
+   },
+   "turn|no_call": {
+    "all_in": 1,
+    "bet": 2,
+    "check": 16,
+    "fold": 5
+   }
+  },
+  {
+   "flop|facing_bet": {
+    "all_in": 1,
+    "call": 17,
+    "raise": 34
+   },
+   "flop|no_call": {
+    "all_in": 1,
+    "bet": 26,
+    "check": 44,
+    "fold": 17
+   },
+   "preflop|facing_bet": {
+    "all_in": 16,
+    "call": 109,
+    "raise": 143
+   },
+   "preflop|no_call": {
+    "check": 19,
+    "fold": 88,
+    "raise": 11
+   },
+   "river|facing_bet": {
+    "call": 8,
+    "raise": 2
+   },
+   "river|no_call": {
+    "bet": 11,
+    "fold": 4
+   },
+   "turn|facing_bet": {
+    "all_in": 2,
+    "call": 6,
+    "raise": 5
+   },
+   "turn|no_call": {
+    "all_in": 1,
+    "bet": 14,
+    "check": 6,
+    "fold": 3
+   }
+  }
+ ],
+ "actions": [
+  "all_in",
+  "bet",
+  "call",
+  "check",
+  "fold",
+  "raise"
+ ],
+ "alpha": 0.5,
+ "context_spec": "phase|pressure",
+ "n_items": 296,
+ "n_windows": 4,
+ "orientation": "component 1 = more aggressive = bot",
+ "seeds": 40,
+ "size_given_action": [
+  {
+   "all_in": {
+    "all_in": 11
+   },
+   "bet": {
+    "half_pot": 1,
+    "third_pot_or_less": 18,
+    "three_quarter_pot": 2
+   },
+   "call": {
+    "not_applicable": 307
+   },
+   "check": {
+    "not_applicable": 81
+   },
+   "fold": {
+    "not_applicable": 135
+   },
+   "raise": {
+    "half_pot": 10,
+    "third_pot_or_less": 29,
+    "three_quarter_pot": 2
+   }
+  },
+  {
+   "all_in": {
+    "all_in": 21
+   },
+   "bet": {
+    "half_pot": 4,
+    "third_pot_or_less": 46,
+    "three_quarter_pot": 1
+   },
+   "call": {
+    "not_applicable": 140
+   },
+   "check": {
+    "not_applicable": 69
+   },
+   "fold": {
+    "not_applicable": 112
+   },
+   "raise": {
+    "half_pot": 95,
+    "pot": 7,
+    "third_pot_or_less": 85,
+    "three_quarter_pot": 8
+   }
+  }
+ ],
+ "sizes": [
+  "all_in",
+  "half_pot",
+  "not_applicable",
+  "pot",
+  "third_pot_or_less",
+  "three_quarter_pot"
+ ],
+ "transfer_rho_mean": 0.7563,
+ "version": "mixture-v2",
+ "windows": [
+  "candidate_normal_70_v41_20260807_r5",
+  "candidate_reuse_70_redteam_v41_20260807",
+  "window_da6247ca65cdc942675797cb21aecc76",
+  "window_f2a0aae692bb2a6c196441f693faa9a0"
+ ]
+}

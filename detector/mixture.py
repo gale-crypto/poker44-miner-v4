@@ -9,18 +9,25 @@ which is density estimation rather than feature engineering.
 HOW IT WAS FITTED WITHOUT LABELS. audit_redteam_leakage rejects a window unless
 Counter(phase|pressure) is identical between the pools, so every context group is
 exactly half bot -- verified on every captured window. That balanced-assignment
-constraint anchors an EM that would otherwise be unidentifiable. Fitted over 438
-de-duplicated captured items; against a permutation null preserving every
-per-context marginal the structure is real (mean z = +3.44, 5 of 6 independent
-windows positive).
+constraint anchors an EM that would otherwise be unidentifiable.
 
-WHAT IT IS NOT. A single EM run lands in an arbitrary local optimum (1 of 10
-seeds reached the best likelihood; split agreement 0.623 against a 0.500 floor).
-The shipped tables come from the consensus of 40 seeds, which is reproducible
-(ensemble-to-ensemble Spearman 0.71-0.91) but still 0.763 in agreement with a
-plain aggression split -- so perhaps a quarter of it is genuinely new. This is a
-measured bet, not a proven improvement, which is why it is enabled per-miner by
-env and not by default.
+v2 CORPUS. v1 claimed 438 "de-duplicated" items but actually counted 575 rows
+that were only 328 unique sessions: r5/r9/r10 are byte-identical replays of one
+70-item corpus, so that block carried 3x weight and the tables were tuned to the
+very window being scored. v2 fits 296 items over 4 pairwise-disjoint windows
+(<0.5 content overlap), and coarsens context from phase|position_group|pressure
+to phase|pressure -- the finest split the redteam gate still guarantees is
+balanced. Cells 134 -> 68, observations per cell 9.8 -> 17.4.
+
+WHAT IT IS NOT -- READ THIS BEFORE TRUSTING IT. Leave-one-window-out says the
+tables transfer (Spearman +0.756 against the tables each held-out window fits for
+itself) but on *every* window they correlate more strongly with plain aggression
+(+0.817 mean) than with that self-fit. Agreement with a pure aggression split is
+0.740. So the part that generalises is close to "count the aggressive actions",
+and the extra structure EM finds is window-specific. Since the feature arm
+already encodes aggression and scores at chance, expect this to land near chance
+too. It is enabled per-miner by env, never by default, and the paired
+normal/inverted arms exist to measure sign and magnitude rather than assume them.
 
 ORIENTATION. The more aggressive component is labelled bot, matching the sign of
 the subnet's own reference model. If that is inverted, the leaderboard will show
@@ -40,8 +47,16 @@ from typing import Any, Dict, List, Optional
 
 ARTIFACT = os.getenv(
     "POKER44_V4_MIXTURE_PATH",
-    str(Path(__file__).resolve().parent / "artifacts" / "mixture_v1.json"),
+    str(Path(__file__).resolve().parent / "artifacts" / "mixture_v2.json"),
 )
+
+# Which component is "bot". The fit orients component 1 as the more aggressive one
+# because that is the sign the subnet's own reference model uses, but nothing in an
+# unlabelled fit can confirm it. `inverted` negates the ratio so a paired arm can
+# settle the question live: whichever arm reports accuracy above 0.500 is correct,
+# and if both sit at 0.500 the signal is absent rather than mis-signed.
+ORIENT = os.getenv("POKER44_V4_MIXTURE_ORIENT", "normal").strip().lower()
+_SIGN = -1.0 if ORIENT == "inverted" else 1.0
 
 _MODEL: Optional[Dict[str, Any]] = None
 _LOADED = False
@@ -71,6 +86,11 @@ def _load() -> Optional[Dict[str, Any]]:
             ],
             "version": raw.get("version", "?"),
             "n_items": raw.get("n_items", 0),
+            # v1 keyed contexts on phase|position_group|pressure; v2 coarsens to
+            # phase|pressure. The artifact carries its own spec so serving cannot
+            # silently key on something the tables were never fitted for.
+            "context_spec": str(raw.get("context_spec")
+                                or "phase|position_group|pressure"),
         }
         _MODEL = model
     except Exception:
@@ -107,14 +127,14 @@ def score_raw(decisions: List[Dict[str, Any]]) -> Optional[float]:
         return None
     alpha = model["alpha"]
     na, ns = model["n_actions"], model["n_sizes"]
+    fields = model["context_spec"].split("|")
     total = 0.0
     for d in decisions:
-        context = "%s|%s|%s" % (
-            d.get("phase") or "", d.get("position_group") or "", d.get("pressure") or "")
+        context = "|".join(str(d.get(f) or "") for f in fields)
         action = str(d.get("action_type") or "")
         size = str(d.get("size_bucket") or "")
         for c in (0, 1):
             value = (_logp(model["act"][c], context, action, na, alpha)
                      + _logp(model["siz"][c], action, size, ns, alpha))
             total += value if c == 1 else -value
-    return total / len(decisions)
+    return _SIGN * total / len(decisions)
